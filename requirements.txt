@@ -1,0 +1,24 @@
+# Traitement audio et vidéo
+pydub>=0.25.1
+soundfile>=0.12.1
+scipy>=1.11.0
+numpy<2.0.0
+
+# Intelligence Artificielle & Deep Learning
+torch>=2.1.0
+torchaudio>=2.1.0
+
+# Diarisation & Détection des locuteurs
+speechbrain>=1.0.0
+scikit-learn>=1.3.0
+
+# Transcription & Traduction
+faster-whisper>=1.0.0
+transformers>=4.35.0
+sentencepiece>=0.1.99
+sacremoses>=0.0.53
+
+# Synthèse vocale & Clonage vocal (XTTS v2)
+TTS>=0.22.0
+python-dotenv>=1.0.0
+
