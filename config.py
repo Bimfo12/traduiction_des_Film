@@ -59,8 +59,8 @@ TRANSLATION_MODEL = "Helsinki-NLP/opus-mt-en-fr"
 # ---------------------------------------------------------------------------
 # Étape 4 : Synthèse vocale & Clonage de Voix
 # ---------------------------------------------------------------------------
-# "gtts" (recommandé: rapide, voix française claire, sans crash) ou "xtts" (clonage vocal Coqui)
-TTS_ENGINE = "gtts"
+# "xtts" (clonage vocal de l'acteur via XTTS v2) ou "gtts" (Google TTS)
+TTS_ENGINE = "xtts"
 XTTS_MODEL_NAME = "tts_models/multilingual/multi-dataset/xtts_v2"
 TTS_SAMPLE_RATE = 24000
 

@@ -26,7 +26,20 @@ def main():
 
         video_path = Path(video_input)
         pipeline = FilmTranslationPipeline(video_path=video_path)
-        pipeline.run_all()
+
+        start_step = 1
+        if pipeline.dialogues_json.exists():
+            print("\n✨ Des répliques traduites et des segments d'acteurs existent déjà pour ce film.")
+            print("Options disponibles :")
+            print("  [1] Doublage avec clonage vocal de chaque acteur (Étape 4) & fusion finale (Étape 5) [Par défaut]")
+            print("  [2] Tout recalculer depuis l'Étape 1 (Extraction, Diarisation, Traduction)")
+            choice = input("Votre choix (1 ou 2, défaut: 1) : ").strip()
+            if choice == "2":
+                start_step = 1
+            else:
+                start_step = 4
+
+        pipeline.run_all(start_step=start_step)
     else:
         args = parse_args()
         pipeline = FilmTranslationPipeline(
