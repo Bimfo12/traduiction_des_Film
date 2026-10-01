@@ -187,7 +187,8 @@ class FilmTranslationPipeline:
             mixer_musique_et_voix(
                 instrumental_file=self.instrumental_audio,
                 voice_file=self.french_voices_only,
-                output_file=self.dubbed_audio
+                output_file=self.dubbed_audio,
+                original_audio_file=self.extracted_audio,
             )
 
         # ----------------------------------------------------
@@ -261,7 +262,7 @@ def parse_args():
         type=str,
         default=config.TTS_ENGINE,
         choices=["gtts", "xtts"],
-        help="Moteur TTS : 'gtts' (Google TTS comme main_via_gpt.py) ou 'xtts' (clonage vocal)"
+        help="Moteur TTS : 'xtts' clone la voix de l'acteur (par défaut), 'gtts' utilise une voix française standard"
     )
     parser.add_argument(
         "--no-music",

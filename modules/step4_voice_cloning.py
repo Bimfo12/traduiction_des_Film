@@ -85,8 +85,9 @@ class VoiceManager:
                     )
                     print("✓ XTTS v2 direct initialisé.")
                 except Exception as e2:
-                    print(f"⚠️ Impossible d'initialiser XTTS ({e2}), repli sur gTTS.")
-                    self.engine = "gtts"
+                    raise RuntimeError(
+                        f"Impossible d'initialiser XTTS pour cloner les voix : {e2}"
+                    ) from e2
         else:
             print("✓ Moteur de synthèse vocale : Google Text-to-Speech (gTTS)")
 
@@ -117,7 +118,13 @@ class VoiceManager:
             # Si le CloneurVocalActeur est actif, il gère automatiquement le meilleur segment de l'acteur
             if self.cloneur is not None:
                 try:
-                    ref_source = reference_wav if (reference_wav and os.path.exists(str(reference_wav))) else speaker
+                    # La référence consolidée est plus représentative qu'une
+                    # fenêtre de diarisation isolée, souvent trop courte.
+                    ref_source = self.voices.get(speaker)
+                    if not ref_source and speaker in self.cloneur.actor_segments:
+                        ref_source = speaker
+                    if not ref_source or (isinstance(ref_source, (str, Path)) and not os.path.exists(str(ref_source))):
+                        ref_source = self.voices.get(speaker)
                     self.cloneur.cloner_voix(
                         text=text,
                         reference_segment=ref_source,
@@ -146,7 +153,13 @@ class VoiceManager:
                         )
                         return output_path
                     except Exception as e:
-                        print(f"  ⚠️ Échec XTTS direct pour {speaker} ({e}), repli automatique sur gTTS.")
+                        raise RuntimeError(
+                            f"Échec du clonage XTTS pour {speaker} : {e}"
+                        ) from e
+
+            raise RuntimeError(
+                f"Aucun extrait de référence valide pour cloner la voix de {speaker}."
+            )
 
         # Méthode 2 : gTTS (Google TTS) en repli
         temp_mp3 = output_path.with_suffix(".mp3")
@@ -212,8 +225,8 @@ def fit_audio_duration(
     input_path: str | Path,
     output_path: str | Path,
     target_duration_ms: float,
-    min_speed: float = 0.90,
-    max_speed: float = 1.15,
+    min_speed: float = config.TTS_MIN_SPEED,
+    max_speed: float = config.TTS_MAX_SPEED,
 ) -> tuple[bool, int]:
     """
     Ajuste légèrement le débit d'une voix TTS.
@@ -443,12 +456,13 @@ def generer_doublage(
         precloned_file = cloned_dir / f"cloned_{idx:05d}_{speaker}.wav"
 
         try:
-            # 1. Vérifier si un clonage vocal existe déjà pour cette réplique (ex: clonnage_vocal.py)
+            # Cache optionnel des fichiers TTS; désactivé par défaut pour
+            # éviter de réutiliser une voix générique après un changement de moteur.
             source_file = None
-            if precloned_file.is_file() and precloned_file.stat().st_size > 1000:
+            if config.REUSE_TTS_CACHE and precloned_file.is_file() and precloned_file.stat().st_size > 1000:
                 print(f"  ✨ Réutilisation du clonage existant : {precloned_file.name}")
                 source_file = precloned_file
-            elif raw_tts_file.is_file() and raw_tts_file.stat().st_size > 1000:
+            elif config.REUSE_TTS_CACHE and raw_tts_file.is_file() and raw_tts_file.stat().st_size > 1000:
                 print(f"  ✨ Réutilisation de l'audio TTS existant : {raw_tts_file.name}")
                 source_file = raw_tts_file
             else:
@@ -472,8 +486,8 @@ def generer_doublage(
                 source_file,
                 fitted_tts_file,
                 target_duration_ms,
-                min_speed=0.90,
-                max_speed=1.15,
+                min_speed=config.TTS_MIN_SPEED,
+                max_speed=config.TTS_MAX_SPEED,
             )
 
             if not success:
@@ -498,13 +512,16 @@ def generer_doublage(
     print(f"\nAssemblage final de la piste audio française ({len(dubbed_segments)} répliques assemblées)...")
     final_audio = AudioSegment.silent(duration=total_duration_ms, frame_rate=24000)
 
-    for seg in dubbed_segments:
+    # Une seule voix à la fois : une réplique superposée est décalée au
+    # premier instant disponible pour rester intelligible.
+    next_available_ms = 0
+    for seg in sorted(dubbed_segments, key=lambda item: (item["start_ms"], item["index"])):
         seg_audio_file = seg["audio_path"]
         if not os.path.exists(seg_audio_file):
             continue
 
         speech = AudioSegment.from_file(seg_audio_file)
-        start_ms = seg["start_ms"]
+        start_ms = max(seg["start_ms"], next_available_ms)
         duration_ms = seg["duration_ms"]
 
         if len(speech) > duration_ms:
@@ -524,7 +541,14 @@ def generer_doublage(
                     f"{overflow / 1000:.2f}s, conservation de la voix naturelle."
                 )
 
+        if len(speech) == 0:
+            continue
+        speech = speech.fade_in(min(20, len(speech))).fade_out(min(35, len(speech)))
         final_audio = final_audio.overlay(speech, position=start_ms)
+        next_available_ms = start_ms + len(speech)
+
+    if len(final_audio) < next_available_ms:
+        final_audio += AudioSegment.silent(duration=next_available_ms - len(final_audio), frame_rate=24000)
 
     final_audio.export(str(final_audio_path), format="wav")
     print(f"✅ Bande audio doublée en français prête : {final_audio_path}")

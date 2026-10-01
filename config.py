@@ -27,20 +27,20 @@ SPEECHBRAIN_MODEL_SOURCE = "speechbrain/spkrec-ecapa-voxceleb"
 SPEECHBRAIN_SAMPLE_RATE = 16000
 
 # Paramètres de détection de voix
-WINDOW_SECONDS = 2.0
-STEP_SECONDS = 1.0
-ENERGY_THRESHOLD = 0.01
+WINDOW_SECONDS = 2.00
+STEP_SECONDS = 1.00
+ENERGY_THRESHOLD = 0.012
 
 # Paramètres de clustering des voix
-CLUSTER_DISTANCE_THRESHOLD = 0.35  # Seuil pour regrouper les voix similaires
+CLUSTER_DISTANCE_THRESHOLD = 0.42  # Équilibre entre séparation et fusion des locuteurs
 NUMBER_OF_SPEAKERS = None          # None pour détection automatique, ou entier si connu
 
 # Durée max de la référence vocale par acteur (secondes)
 REFERENCE_MAX_SECONDS = 20.0
 
 # Fusion de segments proches d'un même locuteur
-MERGE_GAP_SECONDS = 0.35
-MIN_SEGMENT_SECONDS = 0.50
+MERGE_GAP_SECONDS = 0.45
+MIN_SEGMENT_SECONDS = 0.70
 
 # ---------------------------------------------------------------------------
 # Étape 3 : Transcription (Whisper) & Traduction (MarianMT)
@@ -63,9 +63,11 @@ TRANSLATION_MODEL = "Helsinki-NLP/opus-mt-en-fr"
 TTS_ENGINE = "xtts"
 XTTS_MODEL_NAME = "tts_models/multilingual/multi-dataset/xtts_v2"
 TTS_SAMPLE_RATE = 24000
+TTS_MIN_SPEED = 0.95
+TTS_MAX_SPEED = 1.05
+REUSE_TTS_CACHE = False
 
 # ---------------------------------------------------------------------------
 # Étape 5 : Fusion Vidéo + Audio (FFmpeg)
 # ---------------------------------------------------------------------------
 AUDIO_BITRATE = "192k"
-

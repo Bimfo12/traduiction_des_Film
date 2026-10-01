@@ -14,6 +14,29 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import config
 
 
+def _get_media_duration(path: Path, stream_selector: str) -> float:
+    result = subprocess.run(
+        [
+            "ffprobe", "-v", "error",
+            "-select_streams", stream_selector,
+            "-show_entries", "stream=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            str(path),
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    for value in result.stdout.splitlines():
+        try:
+            duration = float(value.strip())
+        except ValueError:
+            continue
+        if duration > 0:
+            return duration
+    raise RuntimeError(f"Impossible de lire la durée de {path}.")
+
+
 def fusionner_video_audio(
     video_path: str | Path,
     audio_path: str | Path,
@@ -21,7 +44,7 @@ def fusionner_video_audio(
     bitrate: str = config.AUDIO_BITRATE
 ) -> Path:
     """
-    Fusionne le flux vidéo original (sans réencodage) avec la nouvelle piste audio doublée en AAC.
+    Ajuste la vitesse vidéo à la durée de la VF et conserve toute la piste audio.
 
     Args:
         video_path: Chemin du fichier vidéo original.
@@ -48,16 +71,26 @@ def fusionner_video_audio(
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
+    video_duration = _get_media_duration(video_path, "v:0")
+    audio_duration = _get_media_duration(audio_path, "a:0")
+    video_tempo = audio_duration / video_duration
+    print(f"Durée vidéo source : {video_duration:.3f}s")
+    print(f"Durée audio VF     : {audio_duration:.3f}s")
+    print(f"Facteur de vitesse : {video_tempo:.5f}x")
+
     command = [
         "ffmpeg",
         "-i", str(video_path),
         "-i", str(audio_path),
         "-map", "0:v:0",       # Flux vidéo du fichier source
         "-map", "1:a:0",       # Flux audio doublé
-        "-c:v", "copy",        # Copie directe sans perte de qualité vidéo
+        "-vf", f"setpts=PTS*{video_tempo:.10f}",
+        "-c:v", "libx264",
+        "-preset", "medium",
+        "-crf", "18",
         "-c:a", "aac",         # Encodage audio haute fidélité
         "-b:a", bitrate,
-        "-shortest",           # Aligne sur la durée
+        "-t", f"{audio_duration:.6f}",
         "-y",
         str(output_path)
     ]
@@ -103,4 +136,3 @@ if __name__ == "__main__":
     a_in = sys.argv[2]
     v_out = sys.argv[3] if len(sys.argv) >= 4 else None
     fusionner_video_audio(v_in, a_in, v_out)
-

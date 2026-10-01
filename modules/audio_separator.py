@@ -120,58 +120,149 @@ def mixer_musique_et_voix(
     instrumental_file: str | Path,
     voice_file: str | Path,
     output_file: str | Path,
-    music_volume: float = 1.0,
-    voice_volume: float = 1.0
+    original_audio_file: str | Path | None = None,
+    music_volume: float = 0.70,
+    voice_volume: float = 1.00,
 ) -> Path:
     """
-    Mélange la musique de fond originale (sans voix anglaise)
-    avec la nouvelle piste vocale française (VF).
-    Basé sur mix_audio() de main_via_gpt.py.
+    Mélange la piste sans voix de Demucs avec la nouvelle voix française.
+
+    La durée finale doit idéalement être celle de l'audio original du film.
     """
+
     instrumental_file = Path(instrumental_file).resolve()
     voice_file = Path(voice_file).resolve()
     output_file = Path(output_file).resolve()
+
     output_file.parent.mkdir(parents=True, exist_ok=True)
 
-    if not instrumental_file.exists():
-        raise FileNotFoundError(f"Piste musicale introuvable : {instrumental_file}")
+    if not instrumental_file.is_file():
+        raise FileNotFoundError(
+            f"Piste instrumentale introuvable : {instrumental_file}"
+        )
 
-    if not voice_file.exists():
-        raise FileNotFoundError(f"Piste vocale introuvable : {voice_file}")
+    if not voice_file.is_file():
+        raise FileNotFoundError(
+            f"Piste vocale introuvable : {voice_file}"
+        )
 
-    duration = get_audio_duration(instrumental_file)
+    # ---------------------------------------------------------
+    # Durée de référence
+    # ---------------------------------------------------------
+    if original_audio_file is not None:
+        original_audio_file = Path(original_audio_file).resolve()
+
+        if not original_audio_file.is_file():
+            raise FileNotFoundError(
+                f"Audio original introuvable : {original_audio_file}"
+            )
+
+        original_duration = get_audio_duration(original_audio_file)
+
+    else:
+        # Fallback : prendre la plus longue des deux pistes
+        instrumental_duration = get_audio_duration(
+            instrumental_file
+        )
+
+        voice_duration = get_audio_duration(
+            voice_file
+        )
+
+        original_duration = 0.0
+        duration = max(
+            instrumental_duration,
+            voice_duration
+        )
+
+    duration = max(
+        original_duration,
+        get_audio_duration(instrumental_file),
+        get_audio_duration(voice_file),
+    )
+
     if duration <= 0:
-        duration = get_audio_duration(voice_file)
+        raise RuntimeError(
+            "Impossible de déterminer la durée finale."
+        )
 
     print("\n" + "=" * 60)
-    print("🎚️ MIXAGE FINAL : MUSIQUE DE FOND + NOUVELLES VOIX VF")
+    print("🎚️ MIXAGE FINAL : MUSIQUE + VOIX VF")
     print("=" * 60)
-    print(f"Musique de fond : {instrumental_file}")
-    print(f"Voix françaises : {voice_file}")
-    print(f"Audio final     : {output_file}")
-    print(f"Durée totale    : {duration:.2f}s")
 
+    print(f"Musique / ambiance : {instrumental_file}")
+    print(f"Voix française     : {voice_file}")
+    print(f"Audio original     : {original_audio_file}")
+    print(f"Durée finale       : {duration:.2f}s")
+    print(f"Volume musique     : {music_volume:.2f}")
+    print(f"Volume voix        : {voice_volume:.2f}")
+
+    # ---------------------------------------------------------
+    # Filtre
+    # ---------------------------------------------------------
     filter_complex = (
-        f"[0:a]volume={music_volume:.2f}[music];"
-        f"[1:a]volume={voice_volume:.2f}[voice];"
-        f"[music][voice]amix=inputs=2:duration=longest:dropout_transition=0:normalize=0[a];"
-        f"[a]atrim=duration={duration:.6f},asetpts=PTS-STARTPTS[out]"
+        f"[0:a]"
+        f"volume={music_volume:.3f},"
+        f"aresample=44100,"
+        f"asetpts=PTS-STARTPTS"
+        f"[music];"
+
+        f"[1:a]"
+        f"volume={voice_volume:.3f},"
+        f"aresample=44100,"
+        f"asetpts=PTS-STARTPTS"
+        f"[voice];"
+
+        f"[music][voice]"
+        f"amix=inputs=2:duration=longest:dropout_transition=0:normalize=0,"
+        f"alimiter=limit=0.90:level=disabled,"
+        f"atrim=duration={duration:.6f},"
+        f"asetpts=PTS-STARTPTS"
+        f"[out]"
     )
 
     command = [
         "ffmpeg",
         "-y",
+
         "-i", str(instrumental_file),
         "-i", str(voice_file),
-        "-filter_complex", filter_complex,
+
+        "-filter_complex",
+        filter_complex,
+
         "-map", "[out]",
-        "-c:a", "pcm_s16le",
+
         "-ar", "44100",
-        "-t", str(duration),
-        str(output_file)
+        "-ac", "2",
+
+        "-c:a", "pcm_s16le",
+
+        "-t", f"{duration:.6f}",
+
+        str(output_file),
     ]
 
-    subprocess.run(command, check=True)
-    print(f"✅ Bande-son complète mixée (musique + voix VF) : {output_file}")
-    return output_file
+    result = subprocess.run(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
 
+    if result.returncode != 0:
+        print(result.stderr)
+        raise RuntimeError(
+            "Erreur FFmpeg pendant le mixage."
+        )
+
+    final_duration = get_audio_duration(output_file)
+
+    print(
+        f"\n✅ Mixage terminé : {output_file}"
+    )
+    print(
+        f"✅ Durée finale réelle : {final_duration:.2f}s"
+    )
+
+    return output_file

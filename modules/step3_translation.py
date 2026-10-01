@@ -60,7 +60,9 @@ class TranscripteurTraducteur:
             str(audio_path),
             language=self.source_lang,
             beam_size=config.WHISPER_BEAM_SIZE,
-            vad_filter=True
+            vad_filter=True,
+            condition_on_previous_text=False,
+            vad_parameters={"min_silence_duration_ms": 350},
         )
 
         texts = [segment.text.strip() for segment in segments if segment.text.strip()]
@@ -183,4 +185,3 @@ if __name__ == "__main__":
         segments_input = json.load(f_in)
 
     transcrire_et_traduire(segments_input, out_dir)
-
