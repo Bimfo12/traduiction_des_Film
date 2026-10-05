@@ -64,7 +64,7 @@ TTS_ENGINE = "xtts"
 XTTS_MODEL_NAME = "tts_models/multilingual/multi-dataset/xtts_v2"
 TTS_SAMPLE_RATE = 24000
 TTS_MIN_SPEED = 0.95
-TTS_MAX_SPEED = 1.05
+TTS_MAX_SPEED = 1.12
 REUSE_TTS_CACHE = False
 
 # ---------------------------------------------------------------------------
@@ -96,3 +96,23 @@ TTS_CHARS_PER_SEC = 14.0
 # ---------------------------------------------------------------------------
 DEMUCS_MODEL = "htdemucs_ft"
 USE_DUCKING = True
+
+# ---------------------------------------------------------------------------
+# Diarisation : fusion des clusters de locuteurs trop proches
+# ---------------------------------------------------------------------------
+# Fusionne après clustering les clusters dont la distance cosine est inférieure
+# à ce seuil. 0.25 est un bon compromis (0.0 = désactivé).
+SPEAKER_MERGE_DISTANCE_THRESHOLD = 0.25
+
+# ---------------------------------------------------------------------------
+# TTS : température XTTS pour stabiliser le timbre vocal par acteur
+# ---------------------------------------------------------------------------
+# 0.30 donne un timbre cohérent entre les répliques. 0.0 = désactivé.
+XTTS_TEMPERATURE = 0.30
+
+# ---------------------------------------------------------------------------
+# Étape 5 : mode de synchronisation vidéo/audio
+# ---------------------------------------------------------------------------
+# "lock_video" (défaut) : la vidéo garde sa durée originale, l'audio est padded/trimé.
+# "match_audio" : ajuste la vitesse vidéo pour correspondre à la durée de l'audio VF.
+VIDEO_SYNC_MODE = "lock_video"

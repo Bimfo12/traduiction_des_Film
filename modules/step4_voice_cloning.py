@@ -461,9 +461,12 @@ def generer_doublage(
 
         available_sec = next_start_sec - start_sec - guard_sec
 
-        # On ne dépasse pas la durée originale si possible,
-        # mais on ne descend pas sous une durée minima trop courte.
-        target_sec = min(duration_sec, max(0.30, available_sec))
+        if available_sec <= 0.10:
+            print(f"  ⚠️ Aucune place suffisante avant la réplique suivante; réplique {idx} ignorée.")
+            continue
+
+        # La durée cible tient compte de la place réelle avant la réplique suivante.
+        target_sec = min(duration_sec, available_sec)
         target_duration_ms = target_sec * 1000.0
 
         print(f"\n[{idx_loop + 1}/{total}] Voix pour {speaker} ({start_sec:.2f}s -> {end_sec:.2f}s, originale {duration_sec:.2f}s, cible {target_sec:.2f}s)")
@@ -514,8 +517,6 @@ def generer_doublage(
                 source_file = raw_tts_file
 
             # 2. Ajustement de la durée pour caler au timing exact du film
-            target_duration_ms = target_sec * 1000.0
-
             success, real_duration_ms = fit_audio_duration(
                 source_file,
                 fitted_tts_file,
@@ -535,6 +536,13 @@ def generer_doublage(
                 "start_ms": int(start_sec * 1000),
                 "duration_ms": real_duration_ms,
                 "target_duration_ms": int(target_duration_ms),
+                "end_limit_ms": int(
+                    min(
+                        start_sec + target_sec,
+                        next_start_sec - guard_sec,
+                    )
+                    * 1000.0
+                ),
                 "audio_path": str(fitted_tts_file),
             })
             print(f"  ✓ Réplique française synchronisée et calée.")
@@ -547,10 +555,7 @@ def generer_doublage(
     final_audio = AudioSegment.silent(duration=total_duration_ms, frame_rate=24000)
 
     dubbed_segments = sorted(dubbed_segments, key=lambda item: (item["start_ms"], item["index"]))
-    guard_ms = int(float(getattr(config, "DUBBING_GUARD_SECONDS", 0.08)) * 1000)
-    next_available_ms = 0
-
-    for i, seg in enumerate(dubbed_segments):
+    for seg in dubbed_segments:
         seg_audio_file = seg["audio_path"]
 
         if not os.path.exists(seg_audio_file):
@@ -558,25 +563,14 @@ def generer_doublage(
 
         desired_start_ms = seg["start_ms"]
 
-        # Ne jamais commencer avant la fin de la réplique précédente + garde
-        start_ms = max(desired_start_ms, next_available_ms + guard_ms)
+        # Les répliques gardent leur position source; leur durée est bornée
+        # par le début prévu de la suivante afin d'éviter un décalage en chaîne.
+        start_ms = desired_start_ms
 
         if start_ms >= total_duration_ms:
             break
 
-        # Fin limite : avant le début original de la réplique suivante
-        if i + 1 < len(dubbed_segments):
-            next_start_ms = dubbed_segments[i + 1]["start_ms"]
-        else:
-            next_start_ms = total_duration_ms
-
-        # On réserve au minimum 250 ms pour éviter les répliques invisibles
-        min_room_ms = 250
-
-        hard_limit_ms = min(
-            total_duration_ms,
-            max(start_ms + min_room_ms, next_start_ms - guard_ms)
-        )
+        hard_limit_ms = min(total_duration_ms, seg["end_limit_ms"])
 
         max_duration_ms = hard_limit_ms - start_ms
 
@@ -608,11 +602,6 @@ def generer_doublage(
         speech = speech.fade_in(fade_in_ms).fade_out(fade_out_ms)
 
         final_audio = final_audio.overlay(speech, position=start_ms)
-
-        next_available_ms = start_ms + len(speech)
-
-    if len(final_audio) < next_available_ms:
-        final_audio += AudioSegment.silent(duration=next_available_ms - len(final_audio), frame_rate=24000)
 
     final_audio.export(str(final_audio_path), format="wav")
     print(f"✅ Bande audio doublée en français prête : {final_audio_path}")

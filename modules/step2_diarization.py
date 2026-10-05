@@ -54,6 +54,58 @@ def _safe_torchaudio_load(filepath, *args, **kwargs):
 torchaudio.load = _safe_torchaudio_load
 
 
+def _cosine_distance(a: np.ndarray, b: np.ndarray) -> float:
+    """Distance cosine entre deux vecteurs."""
+    a = np.asarray(a, dtype=np.float32).reshape(-1)
+    b = np.asarray(b, dtype=np.float32).reshape(-1)
+    denom = (np.linalg.norm(a) * np.linalg.norm(b)) + 1e-12
+    return float(1.0 - float(np.dot(a, b) / denom))
+
+
+def _merge_close_speaker_clusters(
+    X: np.ndarray,
+    labels: np.ndarray,
+    threshold: float,
+) -> tuple[np.ndarray, dict]:
+    """
+    Fusionne les clusters dont les centroïdes sont à une distance cosine
+    inférieure à *threshold*. Retourne les nouveaux labels et un mapping.
+    """
+    unique_labels = np.unique(labels)
+    centroids = {
+        int(lbl): X[labels == lbl].mean(axis=0)
+        for lbl in unique_labels
+    }
+
+    parent: dict[int, int] = {int(lbl): int(lbl) for lbl in unique_labels}
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(x: int, y: int) -> None:
+        parent[find(x)] = find(y)
+
+    sorted_labels = sorted(int(l) for l in unique_labels)
+    for i, la in enumerate(sorted_labels):
+        for lb in sorted_labels[i + 1:]:
+            if _cosine_distance(centroids[la], centroids[lb]) < threshold:
+                union(la, lb)
+
+    root_to_new: dict[int, int] = {}
+    new_labels = np.empty_like(labels)
+    for lbl in unique_labels:
+        root = find(int(lbl))
+        if root not in root_to_new:
+            root_to_new[root] = len(root_to_new)
+        new_labels[labels == lbl] = root_to_new[root]
+
+    mapping = {int(old): root_to_new[find(int(old))] for old in unique_labels}
+    return new_labels, mapping
+
+
 def _read_wav_slice(
     audio_path: Path,
     info,
@@ -200,6 +252,58 @@ def _enforce_no_overlap(
     return out
 
 
+def _cosine_distance(a: np.ndarray, b: np.ndarray) -> float:
+    """Distance cosine entre deux vecteurs."""
+    a = np.asarray(a, dtype=np.float32).reshape(-1)
+    b = np.asarray(b, dtype=np.float32).reshape(-1)
+    denom = (np.linalg.norm(a) * np.linalg.norm(b)) + 1e-12
+    return float(1.0 - float(np.dot(a, b) / denom))
+
+
+def _merge_close_speaker_clusters(
+    X: np.ndarray,
+    labels: np.ndarray,
+    threshold: float,
+) -> tuple[np.ndarray, dict]:
+    """
+    Fusionne les clusters dont les centroïdes sont à une distance cosine
+    inférieure à *threshold*. Retourne les nouveaux labels et un mapping.
+    """
+    unique_labels = np.unique(labels)
+    centroids = {
+        int(lbl): X[labels == lbl].mean(axis=0)
+        for lbl in unique_labels
+    }
+
+    parent: dict[int, int] = {int(lbl): int(lbl) for lbl in unique_labels}
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(x: int, y: int) -> None:
+        parent[find(x)] = find(y)
+
+    sorted_labels = sorted(int(l) for l in unique_labels)
+    for i, la in enumerate(sorted_labels):
+        for lb in sorted_labels[i + 1:]:
+            if _cosine_distance(centroids[la], centroids[lb]) < threshold:
+                union(la, lb)
+
+    root_to_new: dict[int, int] = {}
+    new_labels = np.empty_like(labels)
+    for lbl in unique_labels:
+        root = find(int(lbl))
+        if root not in root_to_new:
+            root_to_new[root] = len(root_to_new)
+        new_labels[labels == lbl] = root_to_new[root]
+
+    mapping = {int(old): root_to_new[find(int(old))] for old in unique_labels}
+    return new_labels, mapping
+
+
 def _choose_best_reference(
     speaker_name: str,
     merged_segments: List[Dict],
@@ -216,59 +320,67 @@ def _choose_best_reference(
     - éviter de mélanger plusieurs émotions / bruits / qualités ;
     - obtenir une voix plus uniforme pour le même acteur ;
     - fournir une référence propre au clonage XTTS.
+
+    Stratégie :
+    1. Cherche d'abord parmi les segments >= min_seconds (idéal)
+    2. Fallback progressif vers >= 1.5 s puis >= 1.0 s si aucun segment long
     """
-    candidates = []
     sr = audio_info.samplerate
 
-    for segment in merged_segments:
-        if segment.get("speaker") != speaker_name:
-            continue
+    def _collect_candidates(floor_sec: float) -> list:
+        result = []
+        for segment in merged_segments:
+            if segment.get("speaker") != speaker_name:
+                continue
 
-        duration = segment["end"] - segment["start"]
-        if duration < min_seconds:
-            continue
+            duration = segment["end"] - segment["start"]
+            if duration < floor_sec:
+                continue
 
-        data = _read_wav_slice(
-            audio_path,
-            audio_info,
-            segment["start"],
-            segment["end"],
-        )
+            data = _read_wav_slice(
+                audio_path,
+                audio_info,
+                segment["start"],
+                segment["end"],
+            )
 
-        if data.shape[0] == 0:
-            continue
+            if data.shape[0] == 0:
+                continue
 
-        # Passage mono pour la référence
-        mono = data.mean(axis=1).astype(np.float32)
+            mono = data.mean(axis=1).astype(np.float32)
+            rms = float(np.sqrt(np.mean(mono * mono)))
 
-        rms = float(np.sqrt(np.mean(mono * mono)))
+            # Rejette les segments trop faibles ou saturés
+            if rms < 0.004 or rms > 0.85:
+                continue
 
-        # Rejette les segments trop faibles ou saturés
-        if rms < 0.004 or rms > 0.85:
-            continue
+            # Estime la stabilité énergétique du segment
+            frame = max(1, int(0.05 * sr))
 
-        # Estime la stabilité énergétique du segment
-        frame = max(1, int(0.05 * sr))
+            if mono.size >= frame * 4:
+                usable = mono[: (mono.size // frame) * frame]
+                frames_arr = usable.reshape(-1, frame)
+                frame_rms = np.sqrt(np.mean(frames_arr * frames_arr, axis=1) + 1e-12)
+                instability = float(np.std(frame_rms) / (np.mean(frame_rms) + 1e-12))
+            else:
+                instability = 1.0
 
-        if mono.size >= frame * 4:
-            usable = mono[: (mono.size // frame) * frame]
-            frames = usable.reshape(-1, frame)
-            frame_rms = np.sqrt(np.mean(frames * frames, axis=1) + 1e-12)
-            instability = float(np.std(frame_rms) / (np.mean(frame_rms) + 1e-12))
-        else:
-            instability = 1.0
+            score = (
+                -abs(duration - target_seconds)
+                - 3.0 * instability
+                + min(rms, 0.25) * 4.0
+            )
+            result.append((score, mono, duration))
+        return result
 
-        # Score :
-        # - durée proche de target_seconds
-        # - faible instabilité énergétique
-        # - niveau raisonnable
-        score = (
-            -abs(duration - target_seconds)
-            - 3.0 * instability
-            + min(rms, 0.25) * 4.0
-        )
-
-        candidates.append((score, mono, duration))
+    # Essai 1 : seuil idéal
+    candidates = _collect_candidates(min_seconds)
+    # Fallback 1 : seuil réduit à 1.5 s
+    if not candidates:
+        candidates = _collect_candidates(1.5)
+    # Fallback 2 : seuil minimal à 1.0 s
+    if not candidates:
+        candidates = _collect_candidates(1.0)
 
     if not candidates:
         return None, 0.0
@@ -287,7 +399,6 @@ def _choose_best_reference(
     mono = _normalize_rms(mono.reshape(-1, 1), target_rms=0.12)
 
     return mono, float(mono.shape[0] / sr)
-
 
 def trouver_audio_voix(
     audio_path: str | Path | None = None,
@@ -616,6 +727,13 @@ def separer_acteurs(
             linkage="average"
         )
         labels = clustering.fit_predict(X)
+
+    # Fusion des clusters trop proches (stabilise les locuteurs)
+    merge_threshold = float(getattr(__import__("config"), "SPEAKER_MERGE_DISTANCE_THRESHOLD", 0.0))
+    if merge_threshold > 0 and len(np.unique(labels)) > 1:
+        print(f"Fusion des clusters trop proches (seuil cosine < {merge_threshold:.2f})...")
+        labels, _ = _merge_close_speaker_clusters(X, labels, merge_threshold)
+        print(f"Locuteurs après fusion : {len(np.unique(labels))}")
 
     raw_segments = []
     for item, label in zip(speech_windows, labels):
