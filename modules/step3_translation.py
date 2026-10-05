@@ -18,6 +18,22 @@ from transformers import MarianMTModel, MarianTokenizer
 import config
 
 
+def _estimer_duree_paroles_fr(texte: str, caracteres_par_seconde: float = 14.0) -> float:
+    """
+    Estimation grossière de la durée de parole en français.
+    Utile pour détecter les traductions trop longues.
+    """
+    if not texte:
+        return 0.0
+
+    propre = "".join(
+        ch for ch in texte
+        if ch.isalnum() or ch.isspace()
+    )
+
+    return max(0.30, len(propre) / caracteres_par_seconde)
+
+
 class TranscripteurTraducteur:
     """
     Gère la transcription audio (Faster-Whisper) et la traduction (MarianMT).
@@ -142,6 +158,14 @@ def transcrire_et_traduire(
         # 2. Traduction MarianMT
         french_text = trans_engine.traduire_texte(original_text)
         print(f"  🇫🇷 {french_text}")
+
+        # 3. Vérifier si la traduction tentra dans la durée disponible
+        estimated_duration = _estimer_duree_paroles_fr(
+            french_text,
+            caracteres_par_seconde=float(getattr(config, "TTS_CHARS_PER_SEC", 14.0))
+        )
+        if estimated_duration > duration * 1.25:
+            print(f"  ⚠️ Traduction probablement trop longue : estimée {estimated_duration:.2f}s pour {duration:.2f}s.")
 
         dialogues.append({
             "index": seg["index"],

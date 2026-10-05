@@ -3,7 +3,10 @@
 Basé sur la logique de diarisation de traductionFilm/dubbing.py
 """
 
+from __future__ import annotations
+
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -15,16 +18,412 @@ import numpy as np
 import torch
 import torchaudio
 import soundfile as sf
-from pydub import AudioSegment
 from sklearn.cluster import AgglomerativeClustering
 from speechbrain.inference.speaker import EncoderClassifier
 
 import config
 
+# Patch de sécurité pour torchaudio.load afin d'éviter l'erreur libnvrtc.so.13 / torchcodec
+_original_torchaudio_load = torchaudio.load
+
+
+def _safe_torchaudio_load(filepath, *args, **kwargs):
+    """
+    Patch pour forcer la lecture audio via soundfile afin d'éviter
+    les erreurs torchcodec / libnvrtc sur certaines installations.
+    """
+    # Si ce n'est pas un chemin, on laisse faire l'implémentation originale
+    if not isinstance(filepath, (str, Path, os.PathLike)):
+        return _original_torchaudio_load(filepath, *args, **kwargs)
+
+    try:
+        data, sr = sf.read(str(filepath), dtype="float32", always_2d=True)
+        waveform = torch.from_numpy(data).T.contiguous()
+        return waveform, int(sr)
+    except Exception as first_error:
+        # Tentative de repli avec le backend soundfile si disponible
+        try:
+            kwargs["backend"] = "soundfile"
+            return _original_torchaudio_load(filepath, *args, **kwargs)
+        except Exception:
+            raise RuntimeError(
+                f"Impossible de charger l'audio : {filepath}"
+            ) from first_error
+
+
+torchaudio.load = _safe_torchaudio_load
+
+
+def _read_wav_slice(
+    audio_path: Path,
+    info,
+    start_sec: float,
+    end_sec: float
+) -> np.ndarray:
+    """
+    Lit une portion d'un fichier audio sans charger tout le fichier.
+    Retourne un tableau numpy de shape (frames, channels).
+    """
+    sr = info.samplerate
+    start_frame = int(max(0, round(start_sec * sr)))
+    end_frame = int(min(info.frames, round(end_sec * sr)))
+
+    if end_frame <= start_frame:
+        return np.zeros((0, max(1, info.channels)), dtype="float32")
+
+    data, _ = sf.read(
+        str(audio_path),
+        start=start_frame,
+        frames=end_frame - start_frame,
+        dtype="float32",
+        always_2d=True,
+    )
+    return data
+
+
+def _write_wav(path: Path, data: np.ndarray, sample_rate: int) -> None:
+    """
+    Écrit un tableau numpy dans un fichier WAV PCM 16-bit.
+    """
+    if data.size == 0:
+        data = np.zeros((1, 1), dtype="float32")
+
+    # Sécurite anti-clipping
+    data = np.clip(data, -1.0, 1.0)
+
+    # Soundfile préfère parfois 1D pour le mono
+    if data.ndim == 2 and data.shape[1] == 1:
+        data = data[:, 0]
+
+    sf.write(str(path), data, sample_rate, subtype="PCM_16")
+
+
+def _workspace_from_vocals(p: Path) -> Path:
+    """
+    Déduit le dossier de travail depuis un chemin vocals.wav.
+
+    Gère par exemple :
+        workspace/video/htdemucs/audio_original/vocals.wav
+        -> workspace/video
+    """
+    if "htdemucs" in p.parts:
+        try:
+            return p.parents[2]
+        except IndexError:
+            return p.parent
+    return p.parent
+
+
+def _resolve_device(device: str) -> str:
+    """
+    Résout le périphérique, avec fallback CPU si CUDA n'est pas disponible.
+    """
+    if device and device.startswith("cuda") and not torch.cuda.is_available():
+        print("⚠️  CUDA demandé mais indisponible. Bascule automatique sur CPU.")
+        return "cpu"
+    return device or "cpu"
+
+
+def _normalize_rms(data: np.ndarray, target_rms: float = 0.12) -> np.ndarray:
+    """
+    Normalise le niveau RMS d'un signal audio.
+    Utile pour avoir des références vocales plus stables.
+    """
+    if data.size == 0:
+        return data
+
+    data = data.astype(np.float32)
+    rms = float(np.sqrt(np.mean(data ** 2)))
+
+    if rms < 1e-6:
+        return data
+
+    gain = target_rms / rms
+
+    # Limite le gain pour ne pas amplifier excessivement le bruit.
+    gain = min(max(gain, 0.25), 8.0)
+
+    data = data * gain
+    return np.clip(data, -0.95, 0.95).astype(np.float32)
+
+
+def _enforce_no_overlap(
+    segments: List[Dict],
+    guard_sec: float = 0.05
+) -> List[Dict]:
+    """
+    Garantit que les segments ne se chevauchent pas.
+    Si deux segments de locuteurs différents se chevauchent,
+    on insère une petite garde de silence.
+    """
+    if not segments:
+        return []
+
+    segments = sorted(segments, key=lambda s: (s["start"], s["end"]))
+    out: List[Dict] = []
+
+    for seg in segments:
+        seg = seg.copy()
+
+        while out:
+            prev = out[-1]
+
+            # Pas de chevauchement
+            if seg["start"] >= prev["end"] + guard_sec:
+                break
+
+            # Même locuteur : fusion
+            if prev.get("speaker_id") == seg.get("speaker_id"):
+                prev["end"] = max(prev["end"], seg["end"])
+                seg = None
+                break
+
+            # Locuteurs différents : on réduit le segment précédent
+            allowed_end = seg["start"] - guard_sec
+
+            if allowed_end > prev["start"] + 0.10:
+                prev["end"] = allowed_end
+                break
+
+            # Sinon le segment précédent est trop court, on le supprime
+            out.pop()
+
+        if seg is None:
+            continue
+
+        if out:
+            seg["start"] = max(seg["start"], out[-1]["end"] + guard_sec)
+
+        if seg["end"] > seg["start"] + 0.10:
+            out.append(seg)
+
+    return out
+
+
+def _choose_best_reference(
+    speaker_name: str,
+    merged_segments: List[Dict],
+    audio_path: Path,
+    audio_info,
+    max_seconds: float,
+    min_seconds: float = 3.0,
+    target_seconds: float = 7.0,
+) -> tuple[np.ndarray | None, float]:
+    """
+    Choisit le meilleur segment continu pour servir de référence vocale.
+
+    Objectif :
+    - éviter de mélanger plusieurs émotions / bruits / qualités ;
+    - obtenir une voix plus uniforme pour le même acteur ;
+    - fournir une référence propre au clonage XTTS.
+    """
+    candidates = []
+    sr = audio_info.samplerate
+
+    for segment in merged_segments:
+        if segment.get("speaker") != speaker_name:
+            continue
+
+        duration = segment["end"] - segment["start"]
+        if duration < min_seconds:
+            continue
+
+        data = _read_wav_slice(
+            audio_path,
+            audio_info,
+            segment["start"],
+            segment["end"],
+        )
+
+        if data.shape[0] == 0:
+            continue
+
+        # Passage mono pour la référence
+        mono = data.mean(axis=1).astype(np.float32)
+
+        rms = float(np.sqrt(np.mean(mono * mono)))
+
+        # Rejette les segments trop faibles ou saturés
+        if rms < 0.004 or rms > 0.85:
+            continue
+
+        # Estime la stabilité énergétique du segment
+        frame = max(1, int(0.05 * sr))
+
+        if mono.size >= frame * 4:
+            usable = mono[: (mono.size // frame) * frame]
+            frames = usable.reshape(-1, frame)
+            frame_rms = np.sqrt(np.mean(frames * frames, axis=1) + 1e-12)
+            instability = float(np.std(frame_rms) / (np.mean(frame_rms) + 1e-12))
+        else:
+            instability = 1.0
+
+        # Score :
+        # - durée proche de target_seconds
+        # - faible instabilité énergétique
+        # - niveau raisonnable
+        score = (
+            -abs(duration - target_seconds)
+            - 3.0 * instability
+            + min(rms, 0.25) * 4.0
+        )
+
+        candidates.append((score, mono, duration))
+
+    if not candidates:
+        return None, 0.0
+
+    candidates.sort(key=lambda x: x[0], reverse=True)
+
+    _, mono, duration = candidates[0]
+
+    # Limite la durée de la référence
+    max_frames = int(max_seconds * sr)
+    if mono.size > max_frames:
+        start = (mono.size - max_frames) // 2
+        mono = mono[start : start + max_frames]
+
+    # Normalisation RMS pour homogénéiser le niveau
+    mono = _normalize_rms(mono.reshape(-1, 1), target_rms=0.12)
+
+    return mono, float(mono.shape[0] / sr)
+
+
+def trouver_audio_voix(
+    audio_path: str | Path | None = None,
+    output_dir: str | Path | None = None,
+    require_vocals: bool = True,
+) -> Tuple[Path, Path]:
+    """
+    Identifie et résout la piste audio vocale séparée de la musique (vocals.wav).
+    Recherche en priorité :
+    1. Si audio_path est fourni et pointe directement vers un vocals.wav existant.
+    2. Les chemins standards Demucs :
+       - /home/edouard/Bureau/traduiction_des_Film/workspace/video/htdemucs/audio_original/vocals.wav
+       - /home/edouard/Bureau/traduiction_des_Film/workspace/video2/htdemucs/audio_original/vocals.wav
+    3. Les pistes dans output_dir ou audio_path.parent (htdemucs/.../vocals.wav ou vocals.wav).
+
+    Retourne:
+        Tuple (chemin_vocals, output_dir_resolu)
+    """
+    known_candidates = [
+        config.DEFAULT_WORK_DIR / "video" / "htdemucs" / "audio_original" / "vocals.wav",
+        config.DEFAULT_WORK_DIR / "video2" / "htdemucs" / "audio_original" / "vocals.wav",
+    ]
+
+    resolved_audio: Path | None = None
+    resolved_output: Path | None = None
+
+    if output_dir is not None:
+        resolved_output = Path(output_dir).resolve()
+
+    if audio_path is not None:
+        audio_str = str(audio_path).strip()
+        # Si c'est un identifiant court comme 'video' ou 'video2'
+        if audio_str in ["video", "video2"]:
+            candidate = config.DEFAULT_WORK_DIR / audio_str / "htdemucs" / "audio_original" / "vocals.wav"
+            if not candidate.is_file():
+                candidate = config.DEFAULT_WORK_DIR / audio_str / "vocals.wav"
+            if candidate.is_file():
+                resolved_audio = candidate
+                if resolved_output is None:
+                    resolved_output = config.DEFAULT_WORK_DIR / audio_str
+        else:
+            p = Path(audio_str).resolve()
+            if p.is_file():
+                # Si c'est déjà un fichier vocals.wav
+                if p.name == "vocals.wav":
+                    resolved_audio = p
+                    if resolved_output is None:
+                        # Si dans un dossier htdemucs/audio_original/vocals.wav
+                        if "htdemucs" in p.parts and len(p.parents) >= 3:
+                            resolved_output = p.parents[2]
+                        else:
+                            resolved_output = p.parent
+                else:
+                    # C'est un audio original (avec musique) : vérifier si vocals.wav existe à côté
+                    search_locations = [
+                        p.parent / "htdemucs" / "audio_original" / "vocals.wav",
+                        p.parent / "htdemucs" / p.stem / "vocals.wav",
+                        p.parent / "vocals.wav",
+                    ]
+                    for loc in search_locations:
+                        if loc.is_file():
+                            print(f"✨ Piste vocale séparée détectée automatiquement : {loc}")
+                            resolved_audio = loc
+                            break
+                    if resolved_audio is None:
+                        resolved_audio = p
+                    if resolved_output is None:
+                        resolved_output = p.parent
+            elif p.is_dir():
+                # Si un dossier de travail a été passé en paramètre
+                search_locations = [
+                    p / "htdemucs" / "audio_original" / "vocals.wav",
+                    p / "vocals.wav",
+                ]
+                for loc in search_locations:
+                    if loc.is_file():
+                        resolved_audio = loc
+                        break
+                if resolved_output is None:
+                    resolved_output = p
+
+    # Si output_dir est défini mais audio_path n'a pas encore trouvé de vocals.wav
+    if resolved_output is not None and (resolved_audio is None or resolved_audio.name != "vocals.wav"):
+        search_locations = [
+            resolved_output / "htdemucs" / "audio_original" / "vocals.wav",
+            resolved_output / "vocals.wav"
+        ]
+        for loc in search_locations:
+            if loc.is_file():
+                print(f"✨ Piste vocale séparée trouvée dans le dossier de travail : {loc}")
+                resolved_audio = loc
+                break
+
+    # Si toujours non résolu, vérifier les chemins connus par défaut
+    if resolved_audio is None:
+        for cand in known_candidates:
+            if cand.is_file():
+                resolved_audio = cand
+                if resolved_output is None:
+                    resolved_output = _workspace_from_vocals(cand)
+                print(f"✨ Utilisation de la piste vocale séparée : {resolved_audio}")
+                break
+
+    if resolved_audio is None or not resolved_audio.is_file():
+        raise FileNotFoundError(
+            f"Impossible de trouver la piste vocale séparée de la musique.\n"
+            f"Veuillez vous assurer que l'un de ces fichiers existe :\n"
+            f"  - {known_candidates[0]}\n"
+            f"  - {known_candidates[1]}\n"
+        )
+
+    if resolved_output is None:
+        resolved_output = _workspace_from_vocals(resolved_audio)
+
+    # Vérification de require_vocals
+    if resolved_audio.stem.lower() != "vocals":
+        if require_vocals:
+            raise FileNotFoundError(
+                f"Aucune piste vocale séparée valide trouvée.\n"
+                f"Fichier reçu : {resolved_audio}\n\n"
+                f"Il faut un fichier type vocals.wav ou vocals.flac.\n"
+                f"Génère-le avec Demucs si nécessaire."
+            )
+        else:
+            print(
+                "⚠️ Aucune piste vocale séparée trouvée. "
+                "Utilisation de l'audio fourni.\n"
+                "La diarisation risque d'être dégradée à cause de la musique."
+            )
+
+    return resolved_audio, resolved_output
+
 
 def separer_acteurs(
-    audio_path: str | Path,
-    output_dir: str | Path,
+    audio_path: str | Path | None = None,
+    output_dir: str | Path | None = None,
     device: str = config.DEVICE,
     energy_threshold: float = config.ENERGY_THRESHOLD,
     cluster_distance_threshold: float = config.CLUSTER_DISTANCE_THRESHOLD,
@@ -34,11 +433,12 @@ def separer_acteurs(
     min_segment_seconds: float = config.MIN_SEGMENT_SECONDS,
 ) -> Tuple[List[Dict], Dict[str, str]]:
     """
-    Détecte les acteurs dans la piste audio, découpe les segments parlés,
-    et extrait pour chaque acteur un échantillon vocal de référence pour le clonage.
+    Détecte les acteurs dans la piste vocale isolée (séparée de la musique),
+    découpe les segments parlés, et extrait pour chaque acteur un échantillon
+    vocal de référence pour le clonage.
 
     Args:
-        audio_path: Chemin du fichier audio complet.
+        audio_path: Chemin du fichier audio (idéalement vocals.wav séparé par Demucs).
         output_dir: Dossier de travail pour enregistrer les segments et références.
 
     Returns:
@@ -46,8 +446,8 @@ def separer_acteurs(
             - segments_data: Liste de dictionnaires décrivant chaque réplique
             - speaker_references: Dictionnaire { 'V1': '/chemin/vers/V1_reference.wav', ... }
     """
-    audio_path = Path(audio_path).resolve()
-    output_dir = Path(output_dir).resolve()
+    audio_path, output_dir = trouver_audio_voix(audio_path, output_dir, require_vocals=True)
+    device = _resolve_device(device)
 
     segments_dir = output_dir / "segments"
     voices_dir = output_dir / "voices"
@@ -57,18 +457,25 @@ def separer_acteurs(
     print("=" * 60)
     print("👥 ÉTAPE 2 : SÉPARATION DES ACTEURS & EXTRACTION DES VOIX")
     print("=" * 60)
-    print(f"Fichier audio : {audio_path}")
-    print(f"Périphérique  : {device}")
+    print(f"Piste vocale traitée : {audio_path}")
+    print(f"Dossier de travail   : {output_dir}")
+    print(f"Périphérique         : {device}")
 
-    # 1. Chargement de l'audio complet avec pydub pour les découpes précises
-    print("Chargement de l'audio complet...")
-    original_audio = AudioSegment.from_file(str(audio_path))
-    audio_duration_sec = len(original_audio) / 1000.0
-    print(f"Durée totale : {audio_duration_sec:.2f} secondes ({audio_duration_sec / 60:.2f} minutes)")
+    # 1. Lecture des informations audio sans charger tout le fichier via pydub
+    print("Lecture des informations audio...")
+    audio_info = sf.info(str(audio_path))
+    audio_duration_sec = audio_info.frames / audio_info.samplerate
+    print(
+        f"Durée totale : {audio_duration_sec:.2f} secondes "
+        f"({audio_duration_sec / 60:.2f} minutes)"
+    )
+    print(f"Échantillonnage : {audio_info.samplerate} Hz")
+    print(f"Canaux : {audio_info.channels}")
 
     # 2. Préparation du modèle SpeechBrain
     print("Chargement du modèle d'empreinte vocale SpeechBrain...")
     pretrained_cache = config.BASE_DIR / "pretrained_models" / "spkrec-ecapa-voxceleb"
+    pretrained_cache.parent.mkdir(parents=True, exist_ok=True)
     speaker_model = EncoderClassifier.from_hparams(
         source=config.SPEECHBRAIN_MODEL_SOURCE,
         savedir=str(pretrained_cache),
@@ -97,46 +504,96 @@ def separer_acteurs(
 
     waveform = waveform.squeeze(0)
     window_size = int(config.WINDOW_SECONDS * sample_rate)
-    step_size = int(config.STEP_SECONDS * sample_rate)
+    
+    # Important :
+    # si step_size < window_size, les fenêtres se chevauchent.
+    # Cela peut créer des segments de diarisation qui se chevauchent.
+    # Pour une version stable, on utilise step_size = window_size.
+    step_size = window_size
 
     # 4. Recherche des fenêtres d'énergie vocale
     print("Recherche des fenêtres de dialogue...")
+
+    min_tail_size = int(getattr(config, "MIN_TAIL_SECONDS", 0.25) * sample_rate)
+
     speech_windows = []
-    position = 0
+    num_samples = waveform.numel()
 
-    while position + window_size <= waveform.numel():
-        chunk = waveform[position:position + window_size]
-        energy = torch.sqrt(torch.mean(chunk ** 2)).item()
+    if num_samples == 0:
+        raise RuntimeError("L'audio chargé est vide.")
 
+    if num_samples < window_size:
+        # Cas d'un audio très court : on teste le fichier entier
+        energy = torch.sqrt(torch.mean(waveform ** 2)).item()
         if energy > energy_threshold:
             speech_windows.append({
-                "start": position / sample_rate,
-                "end": (position + window_size) / sample_rate,
-                "audio": chunk
+                "start_sample": 0,
+                "end_sample": num_samples,
+                "start": 0.0,
+                "end": num_samples / sample_rate,
             })
+    else:
+        last_start = num_samples - window_size
 
-        position += step_size
+        for start_sample in range(0, last_start + 1, step_size):
+            end_sample = start_sample + window_size
+            chunk = waveform[start_sample:end_sample]
+            energy = torch.sqrt(torch.mean(chunk ** 2)).item()
+
+            if energy > energy_threshold:
+                speech_windows.append({
+                    "start_sample": start_sample,
+                    "end_sample": end_sample,
+                    "start": start_sample / sample_rate,
+                    "end": end_sample / sample_rate,
+                })
+
+        # Gestion de la queue finale si elle est suffisante
+        processed_until = ((last_start // step_size) * step_size) + window_size
+        if processed_until < num_samples:
+            tail = waveform[processed_until:num_samples]
+            if tail.numel() >= min_tail_size:
+                energy = torch.sqrt(torch.mean(tail ** 2)).item()
+                if energy > energy_threshold:
+                    speech_windows.append({
+                        "start_sample": processed_until,
+                        "end_sample": num_samples,
+                        "start": processed_until / sample_rate,
+                        "end": num_samples / sample_rate,
+                    })
 
     print(f"Fenêtres de parole détectées : {len(speech_windows)}")
+
     if not speech_windows:
         raise RuntimeError(
-            "Aucun passage parlé détecté. Vérifiez le volume audio ou ajustez ENERGY_THRESHOLD."
+            "Aucun passage parlé détecté. Vérifie le volume audio ou abaisse ENERGY_THRESHOLD."
         )
 
     # 5. Extraction des embeddings vocaux
     print("Extraction des empreintes vocales des acteurs...")
+
     embeddings = []
     total_windows = len(speech_windows)
+
     for idx, item in enumerate(speech_windows, start=1):
         if idx % 20 == 0 or idx == total_windows:
-            print(f"\rTraitement empreintes : {idx}/{total_windows} ({idx * 100 // total_windows}%)", end="", flush=True)
+            print(
+                f"\rTraitement empreintes : {idx}/{total_windows} "
+                f"({idx * 100 // total_windows}%)",
+                end="",
+                flush=True,
+            )
 
-        audio_batch = item["audio"].unsqueeze(0).to(device)
+        chunk = waveform[item["start_sample"]:item["end_sample"]]
+        audio_batch = chunk.unsqueeze(0).to(device)
+
         with torch.no_grad():
             embedding = speaker_model.encode_batch(audio_batch)
+
         embeddings.append(embedding.squeeze().detach().cpu().numpy())
 
     print("\nExtraction des empreintes terminée.")
+
     X = np.asarray(embeddings)
 
     # 6. Clustering des locuteurs
@@ -187,6 +644,22 @@ def separer_acteurs(
     # Filtrer les segments trop courts
     merged_segments = [s for s in merged_segments if (s["end"] - s["start"]) >= min_segment_seconds]
 
+    if not merged_segments:
+        raise RuntimeError(
+            "Aucun segment de dialogue valide après filtrage.\n"
+            "Essaie de diminuer MIN_SEGMENT_SECONDS ou ENERGY_THRESHOLD."
+        )
+
+    # Supprime tout chevauchement résiduel entre segments
+    guard_sec = float(getattr(config, "SEGMENT_GUARD_SECONDS", 0.05))
+    merged_segments = _enforce_no_overlap(merged_segments, guard_sec=guard_sec)
+
+    # Nouveau filtrage après nettoyage
+    merged_segments = [
+        s for s in merged_segments
+        if (s["end"] - s["start"]) >= min_segment_seconds
+    ]
+
     # Attribution de noms conviviaux aux acteurs (V1, V2, ...) selon leur ordre d'apparition
     speaker_mapping = {}
     for segment in merged_segments:
@@ -204,41 +677,71 @@ def separer_acteurs(
 
     # 8. Extraction des fichiers de référence vocale pour chaque acteur
     print("\nExtraction des échantillons de référence vocale pour chaque acteur...")
+
     speaker_references = {}
+
+    ref_min_seconds = float(getattr(config, "REFERENCE_MIN_SECONDS", 3.0))
+    ref_target_seconds = float(getattr(config, "REFERENCE_TARGET_SECONDS", 7.0))
 
     for speaker_num in range(1, total_actors + 1):
         speaker_name = f"V{speaker_num}"
-        reference_audio = AudioSegment.empty()
-        accumulated_seconds = 0.0
 
-        for segment in merged_segments:
-            if segment["speaker"] != speaker_name:
-                continue
+        ref_data, ref_seconds = _choose_best_reference(
+            speaker_name=speaker_name,
+            merged_segments=merged_segments,
+            audio_path=audio_path,
+            audio_info=audio_info,
+            max_seconds=reference_max_seconds,
+            min_seconds=ref_min_seconds,
+            target_seconds=ref_target_seconds,
+        )
 
-            start_ms = int(segment["start"] * 1000)
-            end_ms = int(segment["end"] * 1000)
-            chunk = original_audio[start_ms:end_ms]
-            chunk_seconds = len(chunk) / 1000.0
+        # Fallback : si aucun segment propre assez long, prendre le premier segment utile
+        if ref_data is None:
+            for segment in merged_segments:
+                if segment["speaker"] != speaker_name:
+                    continue
 
-            remaining = reference_max_seconds - accumulated_seconds
-            if remaining <= 0:
+                duration = segment["end"] - segment["start"]
+                if duration < 1.0:
+                    continue
+
+                data = _read_wav_slice(
+                    audio_path,
+                    audio_info,
+                    segment["start"],
+                    segment["end"],
+                )
+
+                if data.shape[0] == 0:
+                    continue
+
+                mono = data.mean(axis=1).astype(np.float32)
+                ref_data = _normalize_rms(mono.reshape(-1, 1), target_rms=0.12)
+                ref_seconds = float(ref_data.shape[0] / audio_info.samplerate)
                 break
 
-            if chunk_seconds > remaining:
-                chunk = chunk[:int(remaining * 1000)]
-                chunk_seconds = remaining
-
-            reference_audio += chunk
-            reference_audio += AudioSegment.silent(duration=150)
-            accumulated_seconds += chunk_seconds
+        # Dernier fallback : silence d'une seconde
+        if ref_data is None:
+            ref_data = np.zeros(
+                (int(1.0 * audio_info.samplerate), 1),
+                dtype=np.float32,
+            )
+            ref_seconds = 1.0
 
         ref_file = voices_dir / f"{speaker_name}_reference.wav"
-        reference_audio.export(str(ref_file), format="wav")
-        speaker_references[speaker_name] = str(ref_file)
-        print(f"  • Voix de référence {speaker_name} ({accumulated_seconds:.1f}s) -> {ref_file}")
+        _write_wav(ref_file, ref_data, audio_info.samplerate)
+
+        speaker_references[speaker_name] = str(ref_file.resolve())
+
+        print(
+            f"  • Voix de référence {speaker_name} "
+            f"({ref_seconds:.1f}s) -> {ref_file}"
+        )
 
     # 9. Découpage et sauvegarde de tous les segments de dialogue
     print(f"\nDécoupage des {len(merged_segments)} segments de répliques...")
+
     segments_data = []
 
     for index, segment in enumerate(merged_segments, start=1):
@@ -247,12 +750,10 @@ def separer_acteurs(
         end = segment["end"]
         duration = end - start
 
-        start_ms = int(start * 1000)
-        end_ms = int(end * 1000)
-        chunk = original_audio[start_ms:end_ms]
-
         segment_file = segments_dir / f"segment_{index:05d}_{speaker}.wav"
-        chunk.export(str(segment_file), format="wav")
+
+        data = _read_wav_slice(audio_path, audio_info, start, end)
+        _write_wav(segment_file, data, audio_info.samplerate)
 
         segments_data.append({
             "index": index,
@@ -260,7 +761,7 @@ def separer_acteurs(
             "start": round(start, 3),
             "end": round(end, 3),
             "duration": round(duration, 3),
-            "audio_path": str(segment_file)
+            "audio_path": str(segment_file.resolve()),
         })
 
     # 10. Sauvegarde des métadonnées

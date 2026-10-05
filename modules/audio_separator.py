@@ -39,7 +39,7 @@ def get_audio_duration(audio_file: str | Path) -> float:
 def separer_voix_musique(
     audio_path: str | Path,
     output_dir: str | Path,
-    model_name: str = "htdemucs",
+    model_name: str | None = None,
     device: str = config.DEVICE
 ) -> Tuple[Path, Path]:
     """
@@ -54,6 +54,9 @@ def separer_voix_musique(
     Returns:
         Tuple (vocals_path, instrumental_path)
     """
+    if model_name is None:
+        model_name = getattr(config, "DEMUCS_MODEL", "htdemucs_ft")
+
     audio_path = Path(audio_path).resolve()
     output_dir = Path(output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -61,12 +64,13 @@ def separer_voix_musique(
     if not audio_path.exists():
         raise FileNotFoundError(f"Fichier audio introuvable : {audio_path}")
 
-    # Vérification des fichiers déjà extraits pour éviter de recalculer inutilement
+    # Vérification des fichiers déjà extraits avec le bon modèle
     target_vocals = output_dir / "vocals.wav"
     target_instrumental = output_dir / "no_vocals.wav"
+    marker = output_dir / f".demucs_{model_name}.done"
 
-    if target_vocals.exists() and target_instrumental.exists():
-        print("✓ Pistes voix et musique de fond déjà séparées :")
+    if target_vocals.exists() and target_instrumental.exists() and marker.exists():
+        print("✓ Pistes voix et musique de fond déjà séparées avec le bon modèle :")
         print(f"  • Voix     : {target_vocals}")
         print(f"  • Musique  : {target_instrumental}")
         return target_vocals, target_instrumental
@@ -89,8 +93,8 @@ def separer_voix_musique(
         "--two-stems=vocals",
         "-n", model_name,
         "-d", device,
-        "--shifts", "1",
-        "--overlap", "0.15",
+        "--shifts", "2",
+        "--overlap", "0.25",
         "-o", str(output_dir),
         str(audio_path)
     ]
@@ -109,6 +113,9 @@ def separer_voix_musique(
     # Déplacer ou copier vers target_vocals et target_instrumental
     shutil.copy2(src_vocals, target_vocals)
     shutil.copy2(src_instrumental, target_instrumental)
+
+    # Écrire le marqueur pour indiquer le modèle utilisé
+    marker.write_text(model_name, encoding="utf-8")
 
     print(f"\n✅ Séparation terminée avec succès !")
     print(f"  • Voix originale   : {target_vocals}")
@@ -198,28 +205,56 @@ def mixer_musique_et_voix(
     print(f"Volume voix        : {voice_volume:.2f}")
 
     # ---------------------------------------------------------
-    # Filtre
+    # Construction du filtre avec ducking optionnel
     # ---------------------------------------------------------
-    filter_complex = (
-        f"[0:a]"
-        f"volume={music_volume:.3f},"
-        f"aresample=44100,"
-        f"asetpts=PTS-STARTPTS"
-        f"[music];"
+    use_ducking = bool(getattr(config, "USE_DUCKING", True))
 
-        f"[1:a]"
-        f"volume={voice_volume:.3f},"
-        f"aresample=44100,"
-        f"asetpts=PTS-STARTPTS"
-        f"[voice];"
+    if use_ducking:
+        filter_complex = (
+            f"[0:a]"
+            f"volume={music_volume:.3f},"
+            f"aresample=44100,"
+            f"asetpts=PTS-STARTPTS"
+            f"[music_raw];"
 
-        f"[music][voice]"
-        f"amix=inputs=2:duration=longest:dropout_transition=0:normalize=0,"
-        f"alimiter=limit=0.90:level=disabled,"
-        f"atrim=duration={duration:.6f},"
-        f"asetpts=PTS-STARTPTS"
-        f"[out]"
-    )
+            f"[1:a]"
+            f"volume={voice_volume:.3f},"
+            f"aresample=44100,"
+            f"asetpts=PTS-STARTPTS,"
+            f"asplit=2[voice_mix][voice_sc];"
+
+            f"[music_raw][voice_sc]"
+            f"sidechaincompress=threshold=0.03:ratio=6:attack=20:release=250"
+            f"[music_ducked];"
+
+            f"[music_ducked][voice_mix]"
+            f"amix=inputs=2:duration=longest:dropout_transition=0:normalize=0,"
+            f"alimiter=limit=0.90:level=disabled,"
+            f"atrim=duration={duration:.6f},"
+            f"asetpts=PTS-STARTPTS"
+            f"[out]"
+        )
+    else:
+        filter_complex = (
+            f"[0:a]"
+            f"volume={music_volume:.3f},"
+            f"aresample=44100,"
+            f"asetpts=PTS-STARTPTS"
+            f"[music];"
+
+            f"[1:a]"
+            f"volume={voice_volume:.3f},"
+            f"aresample=44100,"
+            f"asetpts=PTS-STARTPTS"
+            f"[voice];"
+
+            f"[music][voice]"
+            f"amix=inputs=2:duration=longest:dropout_transition=0:normalize=0,"
+            f"alimiter=limit=0.90:level=disabled,"
+            f"atrim=duration={duration:.6f},"
+            f"asetpts=PTS-STARTPTS"
+            f"[out]"
+        )
 
     command = [
         "ffmpeg",

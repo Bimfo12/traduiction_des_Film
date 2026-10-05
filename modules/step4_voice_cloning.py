@@ -115,21 +115,28 @@ class VoiceManager:
 
         # Méthode 1 : Clonage vocal de l'acteur via XTTS v2
         if self.engine == "xtts":
-            # Si le CloneurVocalActeur est actif, il gère automatiquement le meilleur segment de l'acteur
+            # Priorité absolue : référence consolidée de l'acteur
+            ref_source = self.voices.get(speaker)
+
+            # Fallback uniquement si la référence consolidée est absente
+            if not ref_source and reference_wav:
+                ref_source = reference_wav
+
+            if not ref_source or not os.path.isfile(str(ref_source)):
+                raise RuntimeError(
+                    f"Aucune référence vocale valide trouvée pour l'acteur {speaker}."
+                )
+
+            ref_source = str(Path(ref_source).resolve())
+
+            # Si le cloneur personnalisé est disponible
             if self.cloneur is not None:
                 try:
-                    # La référence consolidée est plus représentative qu'une
-                    # fenêtre de diarisation isolée, souvent trop courte.
-                    ref_source = self.voices.get(speaker)
-                    if not ref_source and speaker in self.cloneur.actor_segments:
-                        ref_source = speaker
-                    if not ref_source or (isinstance(ref_source, (str, Path)) and not os.path.exists(str(ref_source))):
-                        ref_source = self.voices.get(speaker)
                     self.cloneur.cloner_voix(
                         text=text,
                         reference_segment=ref_source,
                         output_file=output_path,
-                        language=language
+                        language=language,
                     )
                     return output_path
                 except Exception as e:
@@ -137,25 +144,18 @@ class VoiceManager:
 
             # Repli XTTS direct
             if self.xtts is not None:
-                voice_file = None
-                if reference_wav and os.path.exists(str(reference_wav)):
-                    voice_file = str(reference_wav)
-                elif speaker in self.voices and os.path.exists(str(self.voices[speaker])):
-                    voice_file = str(self.voices[speaker])
-
-                if voice_file:
-                    try:
-                        self.xtts.tts_to_file(
-                            text=text,
-                            speaker_wav=voice_file,
-                            language=language,
-                            file_path=str(output_path)
-                        )
-                        return output_path
-                    except Exception as e:
-                        raise RuntimeError(
-                            f"Échec du clonage XTTS pour {speaker} : {e}"
-                        ) from e
+                try:
+                    self.xtts.tts_to_file(
+                        text=text,
+                        speaker_wav=ref_source,
+                        language=language,
+                        file_path=str(output_path)
+                    )
+                    return output_path
+                except Exception as e:
+                    raise RuntimeError(
+                        f"Échec du clonage XTTS pour {speaker} : {e}"
+                    ) from e
 
             raise RuntimeError(
                 f"Aucun extrait de référence valide pour cloner la voix de {speaker}."
@@ -440,7 +440,10 @@ def generer_doublage(
     total = len(dialogues)
     cloned_dir = output_dir / "tts_cloned"
 
-    for i, dialog in enumerate(dialogues, start=1):
+    # Tri des dialogues pour calculer la durée disponible
+    dialogues = sorted(dialogues, key=lambda d: (d["start"], d["index"]))
+
+    for idx_loop, dialog in enumerate(dialogues):
         idx = dialog["index"]
         speaker = dialog["speaker"]
         french_text = dialog["french_text"]
@@ -448,14 +451,34 @@ def generer_doublage(
         end_sec = dialog["end"]
         duration_sec = dialog["duration"]
 
-        print(f"\n[{i}/{total}] Voix pour {speaker} ({start_sec:.2f}s -> {end_sec:.2f}s, {duration_sec:.2f}s)")
-        print(f"  Texte FR : \"{french_text}\"")
+        # Calcul de la durée réellement disponible jusqu'à la réplique suivante
+        guard_sec = float(getattr(config, "DUBBING_GUARD_SECONDS", 0.08))
+
+        if idx_loop + 1 < len(dialogues):
+            next_start_sec = dialogues[idx_loop + 1]["start"]
+        else:
+            next_start_sec = total_duration_ms / 1000.0
+
+        available_sec = next_start_sec - start_sec - guard_sec
+
+        # On ne dépasse pas la durée originale si possible,
+        # mais on ne descend pas sous une durée minima trop courte.
+        target_sec = min(duration_sec, max(0.30, available_sec))
+        target_duration_ms = target_sec * 1000.0
+
+        print(f"\n[{idx_loop + 1}/{total}] Voix pour {speaker} ({start_sec:.2f}s -> {end_sec:.2f}s, originale {duration_sec:.2f}s, cible {target_sec:.2f}s)")
+        print(f"  Texte FR : \"{french_text[:80]}...\" " if len(french_text) > 80 else f"  Texte FR : \"{french_text}\"")
 
         raw_tts_file = tts_dir / f"tts_{idx:05d}_{speaker}_raw.wav"
         fitted_tts_file = tts_dir / f"tts_{idx:05d}_{speaker}.wav"
         precloned_file = cloned_dir / f"cloned_{idx:05d}_{speaker}.wav"
 
         try:
+            # Fixe une graine aléatoire par acteur pour stabiliser XTTS
+            seed = int.from_bytes(speaker.encode("utf-8"), "little") % 2147483647
+            torch.manual_seed(seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(seed)
             # Cache optionnel des fichiers TTS; désactivé par défaut pour
             # éviter de réutiliser une voix générique après un changement de moteur.
             source_file = None
@@ -466,8 +489,19 @@ def generer_doublage(
                 print(f"  ✨ Réutilisation de l'audio TTS existant : {raw_tts_file.name}")
                 source_file = raw_tts_file
             else:
-                # Référence audio : segment original de l'acteur issu de segments/ ou voix extraite
-                ref_segment = dialog.get("audio_segment_original") or speaker_references.get(speaker)
+                # Référence audio : toujours priorité à la référence consolidée de l'acteur
+                ref_segment = speaker_references.get(speaker)
+
+                if not ref_segment:
+                    # Fallback uniquement en secours
+                    ref_segment = dialog.get("audio_segment_original")
+
+                if not ref_segment:
+                    print(f"  ❌ Aucune référence disponible pour {speaker}, réplique ignorée.")
+                    continue
+
+                # Enregistre la voix pour le moteur TTS
+                voice_manager.register_voice(speaker, ref_segment)
 
                 # Synthèse vocale avec clonage de l'acteur
                 voice_manager.speak(
@@ -480,7 +514,7 @@ def generer_doublage(
                 source_file = raw_tts_file
 
             # 2. Ajustement de la durée pour caler au timing exact du film
-            target_duration_ms = duration_sec * 1000.0
+            target_duration_ms = target_sec * 1000.0
 
             success, real_duration_ms = fit_audio_duration(
                 source_file,
@@ -508,43 +542,73 @@ def generer_doublage(
         except Exception as e:
             print(f"  ❌ Erreur génération réplique {idx} ({speaker}): {e}")
 
-    # 3. Réassemblage de la piste globale synchronisée
+    # 3. Réassemblage de la piste globale synchronisée (stricte sans chevauchement)
     print(f"\nAssemblage final de la piste audio française ({len(dubbed_segments)} répliques assemblées)...")
     final_audio = AudioSegment.silent(duration=total_duration_ms, frame_rate=24000)
 
-    # Une seule voix à la fois : une réplique superposée est décalée au
-    # premier instant disponible pour rester intelligible.
+    dubbed_segments = sorted(dubbed_segments, key=lambda item: (item["start_ms"], item["index"]))
+    guard_ms = int(float(getattr(config, "DUBBING_GUARD_SECONDS", 0.08)) * 1000)
     next_available_ms = 0
-    for seg in sorted(dubbed_segments, key=lambda item: (item["start_ms"], item["index"])):
+
+    for i, seg in enumerate(dubbed_segments):
         seg_audio_file = seg["audio_path"]
+
         if not os.path.exists(seg_audio_file):
             continue
 
+        desired_start_ms = seg["start_ms"]
+
+        # Ne jamais commencer avant la fin de la réplique précédente + garde
+        start_ms = max(desired_start_ms, next_available_ms + guard_ms)
+
+        if start_ms >= total_duration_ms:
+            break
+
+        # Fin limite : avant le début original de la réplique suivante
+        if i + 1 < len(dubbed_segments):
+            next_start_ms = dubbed_segments[i + 1]["start_ms"]
+        else:
+            next_start_ms = total_duration_ms
+
+        # On réserve au minimum 250 ms pour éviter les répliques invisibles
+        min_room_ms = 250
+
+        hard_limit_ms = min(
+            total_duration_ms,
+            max(start_ms + min_room_ms, next_start_ms - guard_ms)
+        )
+
+        max_duration_ms = hard_limit_ms - start_ms
+
+        if max_duration_ms < 100:
+            continue
+
         speech = AudioSegment.from_file(seg_audio_file)
-        start_ms = max(seg["start_ms"], next_available_ms)
-        duration_ms = seg["duration_ms"]
-
-        if len(speech) > duration_ms:
-            overflow = len(speech) - duration_ms
-
-            # On ne coupe que si le dépassement est très faible.
-            # Sinon on préserve la parole naturelle.
-            if overflow <= 120:
-                speech = speech[:duration_ms]
-                print(
-                    f"  ✂️ Petite coupe de {overflow} ms "
-                    f"pour respecter le timing."
-                )
-            else:
-                print(
-                    f"  ⚠️ Réplique plus longue que le segment de "
-                    f"{overflow / 1000:.2f}s, conservation de la voix naturelle."
-                )
 
         if len(speech) == 0:
             continue
-        speech = speech.fade_in(min(20, len(speech))).fade_out(min(35, len(speech)))
+
+        # Coupe stricte pour éviter tout chevauchement
+        if len(speech) > max_duration_ms:
+            overflow_ms = len(speech) - max_duration_ms
+            speech = speech[:max_duration_ms]
+
+            if overflow_ms > 150:
+                print(
+                    f"  ⚠️ Réplique {seg['index']} tronquée de {overflow_ms / 1000:.2f}s "
+                    f"pour éviter un chevauchement."
+                )
+
+        if len(speech) < 80:
+            continue
+
+        fade_in_ms = min(15, len(speech) // 4)
+        fade_out_ms = min(30, len(speech) // 4)
+
+        speech = speech.fade_in(fade_in_ms).fade_out(fade_out_ms)
+
         final_audio = final_audio.overlay(speech, position=start_ms)
+
         next_available_ms = start_ms + len(speech)
 
     if len(final_audio) < next_available_ms:
