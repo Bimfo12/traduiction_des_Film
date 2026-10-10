@@ -1,0 +1,78 @@
+# ==============================
+# Python
+# ==============================
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Environnements virtuels
+venv/
+env/
+.env/
+.venv/
+
+# Version Python locale
+.python-version
+
+# ==============================
+# Fichiers médias (lourds)
+# ==============================
+# Vidéos sources et sorties
+*.mp4
+*.mkv
+*.avi
+*.mov
+*.webm
+
+# Audio
+*.wav
+*.mp3
+*.flac
+*.ogg
+*.m4a
+
+# ==============================
+# Dossiers de travail (générés)
+# ==============================
+# Workspace intermédiaire (généré à l'exécution)
+workspace/
+
+# Dossier de sorties vidéo finales
+output/
+
+# Modèles pré-entraînés (trop lourds pour Git)
+pretrained_models/
+
+# ==============================
+# Secrets & Configuration sensible
+# ==============================
+# Fichier de config (peut contenir des clés API)
+config.py
+.env
+*.env
+secrets.json
+
+# ==============================
+# IDE & Outils
+# ==============================
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ==============================
+# Système
+# ==============================
+.DS_Store
+Thumbs.db
+
+# ==============================
+# Logs & fichiers temporaires
+# ==============================
+*.log
+*.tmp
+*.cache
+.demucs_*.done
+

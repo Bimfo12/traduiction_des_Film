@@ -43,25 +43,36 @@ MERGE_GAP_SECONDS = 0.45
 MIN_SEGMENT_SECONDS = 0.70
 
 # ---------------------------------------------------------------------------
-# Étape 3 : Transcription (Whisper) & Traduction (MarianMT)
+# Étape 3 : Transcription (Whisper) & Traduction (Malgache / Manuelle)
 # ---------------------------------------------------------------------------
-SOURCE_LANGUAGE = "en"
-TARGET_LANGUAGE = "fr"
+# Langue source de la vidéo : "auto" (détecte automatiquement le français ou l'anglais), ou "fr", "en"
+SOURCE_LANGUAGE = "auto"
+
+# Langue cible : Malgache ("mg")
+TARGET_LANGUAGE = "mg"
+
+# Mode de traduction manuelle : si True, génère le fichier texte avec les répliques
+# malgaches laissées vides afin que l'utilisateur puisse les compléter manuellement.
+MANUAL_TRANSLATION = True
+DIALOGUES_MALGACHE_TXT = "dialogues_malgache.txt"
 
 # Modèle Whisper ("tiny", "base", "small", "medium", "large-v3")
 WHISPER_MODEL = "small"
 WHISPER_COMPUTE_TYPE = "float16" if USE_CUDA else "int8"
 WHISPER_BEAM_SIZE = 5
 
-# Modèle de traduction Hugging Face MarianMT
+# Modèle de traduction automatique (optionnel, utilisé uniquement si MANUAL_TRANSLATION est False)
 TRANSLATION_MODEL = "Helsinki-NLP/opus-mt-en-fr"
 
 # ---------------------------------------------------------------------------
 # Étape 4 : Synthèse vocale & Clonage de Voix
 # ---------------------------------------------------------------------------
-# "xtts" (clonage vocal de l'acteur via XTTS v2) ou "gtts" (Google TTS)
+# "xtts" (clonage vocal de l'acteur via XTTS v2) ou "gtts" (Google TTS, supporte 'mg')
 TTS_ENGINE = "xtts"
 XTTS_MODEL_NAME = "tts_models/multilingual/multi-dataset/xtts_v2"
+# Pour XTTS, 'mg' n'étant pas une langue native du modèle, on utilise 'fr' ou 'it'
+# pour la prononciation phonétique latine fluide de l'alphabet malgache
+XTTS_LANGUAGE = "fr"
 TTS_SAMPLE_RATE = 24000
 TTS_MIN_SPEED = 0.95
 TTS_MAX_SPEED = 1.12

@@ -252,57 +252,6 @@ def _enforce_no_overlap(
     return out
 
 
-def _cosine_distance(a: np.ndarray, b: np.ndarray) -> float:
-    """Distance cosine entre deux vecteurs."""
-    a = np.asarray(a, dtype=np.float32).reshape(-1)
-    b = np.asarray(b, dtype=np.float32).reshape(-1)
-    denom = (np.linalg.norm(a) * np.linalg.norm(b)) + 1e-12
-    return float(1.0 - float(np.dot(a, b) / denom))
-
-
-def _merge_close_speaker_clusters(
-    X: np.ndarray,
-    labels: np.ndarray,
-    threshold: float,
-) -> tuple[np.ndarray, dict]:
-    """
-    Fusionne les clusters dont les centroïdes sont à une distance cosine
-    inférieure à *threshold*. Retourne les nouveaux labels et un mapping.
-    """
-    unique_labels = np.unique(labels)
-    centroids = {
-        int(lbl): X[labels == lbl].mean(axis=0)
-        for lbl in unique_labels
-    }
-
-    parent: dict[int, int] = {int(lbl): int(lbl) for lbl in unique_labels}
-
-    def find(x: int) -> int:
-        while parent[x] != x:
-            parent[x] = parent[parent[x]]
-            x = parent[x]
-        return x
-
-    def union(x: int, y: int) -> None:
-        parent[find(x)] = find(y)
-
-    sorted_labels = sorted(int(l) for l in unique_labels)
-    for i, la in enumerate(sorted_labels):
-        for lb in sorted_labels[i + 1:]:
-            if _cosine_distance(centroids[la], centroids[lb]) < threshold:
-                union(la, lb)
-
-    root_to_new: dict[int, int] = {}
-    new_labels = np.empty_like(labels)
-    for lbl in unique_labels:
-        root = find(int(lbl))
-        if root not in root_to_new:
-            root_to_new[root] = len(root_to_new)
-        new_labels[labels == lbl] = root_to_new[root]
-
-    mapping = {int(old): root_to_new[find(int(old))] for old in unique_labels}
-    return new_labels, mapping
-
 
 def _choose_best_reference(
     speaker_name: str,
